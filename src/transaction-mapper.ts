@@ -1,4 +1,4 @@
-import { LunchFlowTransaction, ActualBudgetTransaction, AccountMapping } from './types';
+import type { LunchFlowTransaction, ActualBudgetTransaction, AccountMapping } from './types';
 
 export class TransactionMapper {
   private accountMappings: AccountMapping[];
@@ -7,17 +7,43 @@ export class TransactionMapper {
     this.accountMappings = accountMappings;
   }
 
+  private merchantSlug(merchant: string): string {
+    return merchant
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .substring(0, 20);
+  }
+
   /**
    * Generate a deterministic synthetic ID for pending transactions without an ID.
    * Uses account, date, amount, and merchant to create a unique identifier.
    */
   private generateSyntheticId(lfTransaction: LunchFlowTransaction): string {
     const amountCents = Math.round(lfTransaction.amount * 100);
-    const merchantSlug = lfTransaction.merchant
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '')
-      .substring(0, 20);
-    return `lf_pending_${lfTransaction.accountId}_${lfTransaction.date}_${amountCents}_${merchantSlug}`;
+    return `lf_pending_${lfTransaction.accountId}_${lfTransaction.date}_${amountCents}_${this.merchantSlug(lfTransaction.merchant)}`;
+  }
+
+  /**
+   * Date-independent key used to reconcile a posted transaction with the
+   * pending row it previously created. The pending->posted transition changes
+   * both the imported_id (synthetic -> lf_<id>) and often the date, so the key
+   * deliberately excludes the date and matches on account + amount + merchant.
+   */
+  private generateReconcileKey(actualBudgetAccountId: string, amountCents: number, merchant: string): string {
+    return `${actualBudgetAccountId}_${amountCents}_${this.merchantSlug(merchant)}`;
+  }
+
+  /**
+   * Compute the reconcile key for an already-imported Actual Budget transaction.
+   * Mirrors generateReconcileKey using the stored account, amount and the raw
+   * imported_payee (which equals the original merchant for Lunch Flow imports).
+   */
+  reconcileKeyForExisting(transaction: ActualBudgetTransaction): string {
+    return this.generateReconcileKey(
+      transaction.account,
+      transaction.amount,
+      transaction.imported_payee
+    );
   }
 
   mapTransaction(lfTransaction: LunchFlowTransaction): ActualBudgetTransaction | null {
@@ -31,11 +57,12 @@ export class TransactionMapper {
     }
 
     const isPending = lfTransaction.isPending === true;
+    const amount = parseInt((lfTransaction.amount * 100).toFixed(0));
 
     return {
       date: lfTransaction.date,
       // Forcing to fixed point integer to avoid floating point precision issues
-      amount: parseInt((lfTransaction.amount * 100).toFixed(0)),
+      amount,
       payee_name: lfTransaction.merchant,
       imported_payee: lfTransaction.merchant,
       account: mapping.actualBudgetAccountId,
@@ -43,6 +70,7 @@ export class TransactionMapper {
       notes: isPending ? `[PENDING] ${lfTransaction.description}` : lfTransaction.description,
       imported_id: isPending ? this.generateSyntheticId(lfTransaction) : `lf_${lfTransaction.id}`,
       isPending: isPending, // Track pending status for UI display
+      reconcileKey: this.generateReconcileKey(mapping.actualBudgetAccountId, amount, lfTransaction.merchant),
     };
   }
 

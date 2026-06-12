@@ -4,7 +4,7 @@ import { TransactionMapper } from './transaction-mapper';
 import { ConfigManager } from './config-manager';
 import { TerminalUI } from './ui';
 import { DuplicateTransactionDetector } from './duplicate-detector';
-import { Config, AccountMapping, ConnectionStatus, LunchFlowTransaction } from './types';
+import type { Config, ConnectionStatus, LunchFlowTransaction, ActualBudgetTransaction } from './types';
 import chalk from 'chalk';
 import Table from 'cli-table3';
 
@@ -230,6 +230,14 @@ export class LunchFlowImporter {
         return;
       }
 
+      // Reconcile pending -> posted transitions before import.
+      // A pending transaction is imported with a synthetic imported_id
+      // (lf_pending_...) while a posted one uses lf_<id>. Because the IDs
+      // differ, Actual Budget's importer can't recognize the posted version as
+      // the same row and would insert a second transaction. Here we delete the
+      // stale pending row so only the posted transaction remains.
+      await this.reconcilePendingTransactions(abTransactions);
+
       // Check for duplicates if enabled
       if (this.config.actualBudget.duplicateCheckingAcrossAccounts) {
         const duplicateCheckSpinner = this.ui.showSpinner('Checking for duplicate transactions across all accounts...');
@@ -282,7 +290,7 @@ export class LunchFlowImporter {
       }
 
       // Remove internal tracking fields before import (Actual Budget API doesn't recognize them)
-      const cleanTransactions = uniqueTransactions.map(({ isDuplicate, duplicateOf, isPending, ...transaction }) => transaction);
+      const cleanTransactions = uniqueTransactions.map(({ isDuplicate, duplicateOf, isPending, reconcileKey, ...transaction }) => transaction);
 
       const importSpinner = this.ui.showSpinner(`Importing ${cleanTransactions.length} transactions...`);
       await this.abClient.importTransactions(cleanTransactions);
@@ -305,6 +313,66 @@ export class LunchFlowImporter {
       if (throwOnError) {
         throw error;
       }
+    }
+  }
+
+  /**
+   * Delete previously-imported pending rows that have since posted.
+   *
+   * Posted transactions keep their stable `lf_<id>` imported_id, so existing
+   * users' data continues to reconcile normally. For each incoming posted
+   * transaction we look for an existing pending row (imported_id starting with
+   * `lf_pending_`) with a matching reconcile key (account + amount + merchant,
+   * date-independent) and delete it, leaving only the posted transaction.
+   */
+  private async reconcilePendingTransactions(incoming: ActualBudgetTransaction[]): Promise<void> {
+    const incomingPosted = incoming.filter(t => !t.isPending && t.reconcileKey);
+    if (incomingPosted.length === 0) {
+      return;
+    }
+
+    const mapper = new TransactionMapper(this.config!.accountMappings);
+    const spinner = this.ui.showSpinner('Reconciling pending transactions...');
+    try {
+      const existingTransactions = await this.abClient.getTransactions();
+
+      // Map reconcile key -> existing pending transaction ids.
+      const pendingByKey = new Map<string, string[]>();
+      for (const existing of existingTransactions) {
+        if (!existing.id || !existing.imported_id?.startsWith('lf_pending_')) {
+          continue;
+        }
+        const key = mapper.reconcileKeyForExisting(existing);
+        const ids = pendingByKey.get(key) ?? [];
+        ids.push(existing.id);
+        pendingByKey.set(key, ids);
+      }
+
+      if (pendingByKey.size === 0) {
+        spinner.stop();
+        return;
+      }
+
+      const idsToDelete = new Set<string>();
+      for (const posted of incomingPosted) {
+        const matches = pendingByKey.get(posted.reconcileKey!);
+        if (matches) {
+          matches.forEach(id => idsToDelete.add(id));
+        }
+      }
+
+      spinner.stop();
+
+      if (idsToDelete.size === 0) {
+        return;
+      }
+
+      await this.abClient.deleteTransactions(Array.from(idsToDelete));
+      this.ui.showInfo(`Reconciled ${idsToDelete.size} pending transaction(s) that have now posted`);
+    } catch (error) {
+      spinner.stop();
+      this.ui.showWarning('Failed to reconcile pending transactions, proceeding with import');
+      console.warn('Pending reconciliation error:', error);
     }
   }
 
