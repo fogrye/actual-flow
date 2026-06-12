@@ -47,3 +47,6 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+
+# pnpm local store
+.pnpm-store/

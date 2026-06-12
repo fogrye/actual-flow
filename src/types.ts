@@ -29,6 +29,7 @@ export interface ActualBudgetTransaction {
   isDuplicate?: boolean;
   duplicateOf?: string; // ID of the existing transaction this duplicates
   isPending?: boolean;
+  reconcileKey?: string; // Date-independent key used to match a posted transaction to its prior pending row
 }
 
 export interface ActualBudgetAccount {

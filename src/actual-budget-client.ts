@@ -1,5 +1,5 @@
 import * as actualAPI from '@actual-app/api';
-import { ActualBudgetTransaction, ActualBudgetAccount } from './types';
+import type { ActualBudgetTransaction, ActualBudgetAccount } from './types';
 import fs from 'fs';
 import path from 'path';
 
@@ -175,6 +175,20 @@ export class ActualBudgetClient {
     } catch (error: any) {
       console.error('Failed to import transactions to Actual Budget:', error.message);
       throw new Error(`Failed to import transactions: ${error.message}`);
+    }
+  }
+
+  async deleteTransactions(transactionIds: string[]): Promise<void> {
+    if (!this.connected) {
+      await this.connect();
+    }
+
+    for (const id of transactionIds) {
+      try {
+        await actualAPI.deleteTransaction(id);
+      } catch (error: any) {
+        console.warn(`Failed to delete transaction ${id}:`, error.message);
+      }
     }
   }
 
